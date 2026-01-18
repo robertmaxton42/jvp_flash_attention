@@ -2485,6 +2485,15 @@ class JVPAttn(Function):
         # Set up grid for kernel launch
         Z_H = Z * H
 
+        # Select block size based on sequence length for better numerical stability
+        # Larger blocks = fewer accumulation steps = better precision for bf16
+        if N_CTX >= 128:
+            BLOCK_M = 64
+            BLOCK_N = 64
+        else:
+            BLOCK_M = MIN_SEQUENCE_LENGTH
+            BLOCK_N = MIN_SEQUENCE_LENGTH
+
         def grid(META: dict[str, Any]) -> JVPAttn.Grid:
             """Determine grid configuration."""
             return JVPAttn.Grid(triton.cdiv(N_CTX, META["BLOCK_M"]), Z_H, 1)
@@ -2492,7 +2501,7 @@ class JVPAttn(Function):
         if USE_TMA and supports_tma():
             # NOTE: On Hopper, we cannot perform a FP8 dot with a non-transposed second tensor.
             y_dim = Z_H * N_CTX
-            tma_block_shape = [MIN_SEQUENCE_LENGTH, HEAD_DIM_K]
+            tma_block_shape = [BLOCK_M, HEAD_DIM_K]
 
             desc_q = TensorDescriptor(
                 q,
@@ -2594,9 +2603,8 @@ class JVPAttn(Function):
                 ENABLE_JVP=ENABLE_JVP,  #
                 ENABLE_DROPOUT=ENABLE_DROPOUT,
                 MASK_TYPE=MASK_TYPE,
-                # NOTE: The following are safe (unit-tested) default values
-                BLOCK_M=MIN_SEQUENCE_LENGTH,  #
-                BLOCK_N=MIN_SEQUENCE_LENGTH,  #
+                BLOCK_M=BLOCK_M,  #
+                BLOCK_N=BLOCK_N,  #
                 num_stages=NUM_STAGES_OPTIONS[0],  #
                 num_warps=4,  #
                 **extra_kern_args,
@@ -2636,9 +2644,8 @@ class JVPAttn(Function):
                 ENABLE_JVP=ENABLE_JVP,  #
                 ENABLE_DROPOUT=ENABLE_DROPOUT,
                 MASK_TYPE=MASK_TYPE,
-                # NOTE: The following are safe (unit-tested) default values
-                BLOCK_M=MIN_SEQUENCE_LENGTH,  #
-                BLOCK_N=MIN_SEQUENCE_LENGTH,  #
+                BLOCK_M=BLOCK_M,  #
+                BLOCK_N=BLOCK_N,  #
                 num_stages=NUM_STAGES_OPTIONS[0],  #
                 num_warps=4,  #
                 **extra_kern_args,
