@@ -2488,15 +2488,16 @@ class JVPAttn(Function):
         # Select block size based on sequence length for better numerical stability
         # Larger blocks = fewer accumulation steps = better precision for bf16
         # Also improves performance on H100 with larger shared memory (228KB)
+        # Note: BLOCK_N must be <= HEAD_DIM (kernel constraint)
         if N_CTX >= 128:
             BLOCK_M = 128
-            BLOCK_N = 64
+            BLOCK_N = min(128, HEAD_DIM_K)
         elif N_CTX >= 64:
             BLOCK_M = 64
-            BLOCK_N = 64
+            BLOCK_N = min(64, HEAD_DIM_K)
         else:
             BLOCK_M = MIN_SEQUENCE_LENGTH
-            BLOCK_N = MIN_SEQUENCE_LENGTH
+            BLOCK_N = min(MIN_SEQUENCE_LENGTH, HEAD_DIM_K)
 
         def grid(META: dict[str, Any]) -> JVPAttn.Grid:
             """Determine grid configuration."""
@@ -2505,13 +2506,15 @@ class JVPAttn(Function):
         if USE_TMA and supports_tma():
             # NOTE: On Hopper, we cannot perform a FP8 dot with a non-transposed second tensor.
             y_dim = Z_H * N_CTX
-            tma_block_shape = [BLOCK_M, HEAD_DIM_K]
+            # Q and O use BLOCK_M, K and V use BLOCK_N
+            tma_block_shape_qo = [BLOCK_M, HEAD_DIM_K]
+            tma_block_shape_kv = [BLOCK_N, HEAD_DIM_K]
 
             desc_q = TensorDescriptor(
                 q,
                 shape=[y_dim, HEAD_DIM_K],
                 strides=[HEAD_DIM_K, 1],
-                block_shape=tma_block_shape,
+                block_shape=tma_block_shape_qo,
             )
             desc_q_t = (
                 desc_q
@@ -2520,7 +2523,7 @@ class JVPAttn(Function):
                     q_t,
                     shape=[y_dim, HEAD_DIM_K],
                     strides=[HEAD_DIM_K, 1],
-                    block_shape=tma_block_shape,
+                    block_shape=tma_block_shape_qo,
                 )
             )
 
@@ -2531,7 +2534,7 @@ class JVPAttn(Function):
                 v_shape = [y_dim, HEAD_DIM_K]
                 v_strides = [HEAD_DIM_K, 1]
             desc_v = TensorDescriptor(
-                v, shape=v_shape, strides=v_strides, block_shape=tma_block_shape
+                v, shape=v_shape, strides=v_strides, block_shape=tma_block_shape_kv
             )
             # NOTE: Probably we could share the shape and strides from above, but whatever
             if q_t is not None and q_t.dtype == torch.float8_e5m2:
@@ -2544,7 +2547,7 @@ class JVPAttn(Function):
                 desc_v
                 if v_t is None
                 else TensorDescriptor(
-                    v_t, shape=t_v_shape, strides=t_v_strides, block_shape=tma_block_shape
+                    v_t, shape=t_v_shape, strides=t_v_strides, block_shape=tma_block_shape_kv
                 )
             )
 
@@ -2552,7 +2555,7 @@ class JVPAttn(Function):
                 k,
                 shape=[y_dim, HEAD_DIM_K],
                 strides=[HEAD_DIM_K, 1],
-                block_shape=tma_block_shape,
+                block_shape=tma_block_shape_kv,
             )
             desc_k_t = (
                 desc_k
@@ -2561,7 +2564,7 @@ class JVPAttn(Function):
                     k_t,
                     shape=[y_dim, HEAD_DIM_K],
                     strides=[HEAD_DIM_K, 1],
-                    block_shape=tma_block_shape,
+                    block_shape=tma_block_shape_kv,
                 )
             )
 
@@ -2569,7 +2572,7 @@ class JVPAttn(Function):
                 o,
                 shape=[y_dim, HEAD_DIM_K],
                 strides=[HEAD_DIM_K, 1],
-                block_shape=tma_block_shape,
+                block_shape=tma_block_shape_qo,
             )
             desc_o_t = (
                 desc_o
@@ -2578,7 +2581,7 @@ class JVPAttn(Function):
                     o_t,
                     shape=[y_dim, HEAD_DIM_K],
                     strides=[HEAD_DIM_K, 1],
-                    block_shape=tma_block_shape,
+                    block_shape=tma_block_shape_qo,
                 )
             )
 
