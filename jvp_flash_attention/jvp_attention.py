@@ -2487,7 +2487,11 @@ class JVPAttn(Function):
 
         # Select block size based on sequence length for better numerical stability
         # Larger blocks = fewer accumulation steps = better precision for bf16
+        # Also improves performance on H100 with larger shared memory (228KB)
         if N_CTX >= 128:
+            BLOCK_M = 128
+            BLOCK_N = 64
+        elif N_CTX >= 64:
             BLOCK_M = 64
             BLOCK_N = 64
         else:
