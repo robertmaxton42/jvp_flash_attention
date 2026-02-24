@@ -2708,6 +2708,7 @@ class JVPAttn(Function):
         sm_scale: float | None = None,
         warp_specialize: bool = True,
         USE_TMA: bool = True,
+        verify_attn_mask: bool = True,
     ) -> Tensor:
         """Forward pass for JVP Attention.
 
@@ -2726,6 +2727,7 @@ class JVPAttn(Function):
             sm_scale: The softmax scale factor.
             warp_specialize: Whether to use warp specialization.
             USE_TMA: Whether to use TMA.
+            verify_attn_mask: Whether to verify the correctness of the provided attention mask.
 
         Returns:
             The output tensor.
@@ -2746,6 +2748,7 @@ class JVPAttn(Function):
             sm_scale,
             warp_specialize,
             USE_TMA,
+            verify_attn_mask,
         )
 
         a, _ = out
@@ -2762,6 +2765,7 @@ class JVPAttn(Function):
         sm_scale: float | None = None,
         warp_specialize: bool = True,
         USE_TMA: bool = True,
+        verify_attn_mask: bool = True,
     ) -> Tensor:
         """Forward pass for JVP Attention with dual tensor inputs.
 
@@ -2780,6 +2784,7 @@ class JVPAttn(Function):
             sm_scale: The softmax scale factor.
             warp_specialize: Whether to use warp specialization.
             USE_TMA: Whether to use TMA.
+            verify_attn_mask: Whether to verify the correctness of the provided attention mask.
 
         Returns:
             The output tensor.
@@ -2807,6 +2812,7 @@ class JVPAttn(Function):
             sm_scale,
             warp_specialize,
             USE_TMA,
+            verify_attn_mask,
         )
 
         a, _ = out
