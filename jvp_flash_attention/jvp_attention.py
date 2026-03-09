@@ -54,7 +54,7 @@ MIN_SEQUENCE_LENGTH = 32  # NOTE: All sequence lengths must be multiples of 2 >=
 def is_hip():
     """Check if the current device is HIP."""
     try:
-        return triton.runtime.driver.active.get_current_target().backend == "hip"
+        return torch.cuda.is_available() and torch.version.hip is not None
     except Exception:
         return False
 
@@ -62,7 +62,7 @@ def is_hip():
 def is_cuda():
     """Check if the current device is CUDA."""
     try:
-        return triton.runtime.driver.active.get_current_target().backend == "cuda"
+        return torch.cuda.is_available() and torch.version.cuda is not None
     except Exception:
         return False
 
