@@ -91,6 +91,17 @@ def is_blackwell():
         return False
 
 
+def _is_compiling() -> bool:
+    """Check whether code is currently being traced by torch.compile."""
+    try:
+        return torch.compiler.is_compiling()
+    except Exception:
+        try:
+            return torch._dynamo.is_compiling()
+        except Exception:
+            return False
+
+
 @triton.jit
 def create_dropout_mask(philox_seed, philox_offset, dropout_p, m, n, stride):
     """Generate dropout mask using Philox RNG.
@@ -2233,6 +2244,189 @@ def _attn_bwd(
     tl.store(dq_ptrs, dq)
 
 
+@torch.library.custom_op("jvp_flash_attention::attn_fwd_dual_triton", mutates_args=())
+def _attn_fwd_dual_triton(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_t: Tensor,
+    k_t: Tensor,
+    v_t: Tensor,
+    mask_tensor: Tensor,
+    sm_scale: float,
+    dropout_p: float,
+    philox_seed: int,
+    causal: bool,
+    warp_specialize: bool,
+    mask_type: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """
+    Opaque custom op wrapper for the dual Triton forward launch used under torch.compile.
+    
+    Args:
+        q: Query tensor of shape (Z, H, N_CTX, HEAD_DIM_Q).
+        k: Key tensor of shape (Z, H, N_CTX, HEAD_DIM_K).
+        v: Value tensor of shape (Z, H, N_CTX, HEAD_DIM_V).
+        q_t: Tangent query tensor of shape (Z, H, N_CTX, HEAD_DIM_Q).
+        k_t: Tangent key tensor of shape (Z, H, N_CTX, HEAD_DIM_K).
+        v_t: Tangent value tensor of shape (Z, H, N_CTX, HEAD_DIM_V).
+        mask_tensor: Mask tensor for attention masking.
+        sm_scale: Scaling factor for the softmax.
+        dropout_p: Dropout probability.
+        philox_seed: Seed for Philox RNG used in dropout.
+        causal: Whether to apply causal masking.
+        warp_specialize: Whether to enable warp specialization in the Triton kernel.
+        mask_type: Type of masking (0: no mask, 1: boolean mask,
+                        2: additive mask).
+
+    Returns:
+        A tuple containing:
+        - Output tensor of shape (Z, H, N_CTX, HEAD_DIM_Q).
+        - Tangent output tensor of shape (Z, H, N_CTX, HEAD_DIM_Q).
+        - Memory tensor M of shape (Z, H, N_CTX) used for the backward pass.
+    """
+    Z, H, N_CTX, HEAD_DIM_Q = q.shape
+    HEAD_DIM_K = k.shape[-1]
+    HEAD_DIM_V = v.shape[-1]
+    if HEAD_DIM_Q != HEAD_DIM_K or HEAD_DIM_K != HEAD_DIM_V:
+        raise ValueError(
+            "JVP attention requires HEAD_DIM_Q == HEAD_DIM_K == HEAD_DIM_V, "
+            f"got ({HEAD_DIM_Q}, {HEAD_DIM_K}, {HEAD_DIM_V})."
+        )
+
+    STAGE = 3 if causal else 1
+    ENABLE_DROPOUT = dropout_p > 0.0
+    o = torch.empty_like(q)
+    o_t = torch.empty_like(q_t)
+    M = torch.empty((Z, H, N_CTX), device=q.device, dtype=torch.float32)
+
+    extra_kern_args = {}
+    if is_hip():
+        waves_per_eu = 3 if HEAD_DIM_K <= 64 else 2
+        extra_kern_args = {"waves_per_eu": waves_per_eu, "allow_flush_denorm": True}
+
+    if is_cuda() and warp_specialize:
+        extra_kern_args["maxnreg"] = 168
+
+    if hasattr(triton, "set_allocator") and is_cuda():
+
+        def alloc_fn(size: int, align: int, _):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+
+    def strides_zhnd(t: Tensor) -> tuple[int, int, int, int]:
+        return (t.stride(0), t.stride(1), t.stride(2), t.stride(3))
+
+    if mask_type == 0:
+        mask_strides = (0, 0, 0, 0)
+    else:
+        mask_strides = (
+            mask_tensor.stride(0),
+            mask_tensor.stride(1),
+            mask_tensor.stride(2),
+            mask_tensor.stride(3),
+        )
+
+    Z_H = Z * H
+
+    def grid(META: dict[str, Any]) -> tuple[int, int, int]:
+        return (triton.cdiv(N_CTX, META["BLOCK_M"]), Z_H, 1)
+
+    _attn_fwd[grid](
+        q,
+        k,
+        v,
+        q_t,
+        k_t,
+        v_t,  #
+        sm_scale,
+        M,
+        o,
+        o_t,  #
+        mask_tensor,  #
+        dropout_p,  #
+        philox_seed,  #
+        *strides_zhnd(q),  #
+        *strides_zhnd(k),  #
+        *strides_zhnd(v),  #
+        *strides_zhnd(q_t),  #
+        *strides_zhnd(k_t),  #
+        *strides_zhnd(v_t),  #
+        *strides_zhnd(o),  #
+        *strides_zhnd(o_t),  #
+        *mask_strides,  #
+        Z,
+        H,  #
+        N_CTX=N_CTX,  #
+        HEAD_DIM=HEAD_DIM_K,  #
+        FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
+        STAGE=STAGE,  #
+        warp_specialize=warp_specialize,  #
+        ENABLE_JVP=True,  #
+        ENABLE_DROPOUT=ENABLE_DROPOUT,
+        MASK_TYPE=mask_type,
+        # NOTE: The following are safe (unit-tested) default values
+        BLOCK_M=MIN_SEQUENCE_LENGTH,  #
+        BLOCK_N=MIN_SEQUENCE_LENGTH,  #
+        num_stages=NUM_STAGES_OPTIONS[0],  #
+        num_warps=4,  #
+        **extra_kern_args,
+    )
+    return o, o_t, M
+
+
+@_attn_fwd_dual_triton.register_fake
+def _attn_fwd_dual_triton_fake(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_t: Tensor,
+    k_t: Tensor,
+    v_t: Tensor,
+    mask_tensor: Tensor,
+    sm_scale: float,
+    dropout_p: float,
+    philox_seed: int,
+    causal: bool,
+    warp_specialize: bool,
+    mask_type: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """
+    Fake implementation of the dual Triton forward launch for compilation purposes.
+    This implementation does not perform any actual computation and returns
+    empty tensors with the appropriate shapes.
+
+    Args:
+        q: Query tensor of shape (Z, H, N_CTX, HEAD_DIM_Q).
+        k: Key tensor of shape (Z, H, N_CTX, HEAD_DIM_K).
+        v: Value tensor of shape (Z, H, N_CTX, HEAD_DIM_V).
+        q_t: Tangent query tensor of shape (Z, H, N_CTX, HEAD_DIM_Q).
+        k_t: Tangent key tensor of shape (Z, H, N_CTX, HEAD_DIM_K).
+        v_t: Tangent value tensor of shape (Z, H, N_CTX, HEAD_DIM_V).
+        mask_tensor: Mask tensor for attention masking.
+        sm_scale: Scaling factor for the softmax.
+        dropout_p: Dropout probability.
+        philox_seed: Seed for Philox RNG used in dropout.
+        causal: Whether to apply causal masking.
+        warp_specialize: Whether to enable warp specialization in the Triton kernel.
+        mask_type: Type of masking (0: no mask, 1: boolean mask,
+                        2: additive mask).
+
+    Returns:
+        A tuple containing:
+        - An empty output tensor of shape (Z, H, N_CTX, HEAD_DIM_Q).
+        - An empty tangent output tensor of shape (Z, H, N_CTX, HEAD_DIM_Q).
+        - An empty memory tensor M of shape (Z, H, N_CTX) used for the backward pass.
+    """
+    Z, H, N_CTX, _ = q.shape
+    return (
+        torch.empty_like(q),
+        torch.empty_like(q_t),
+        torch.empty((Z, H, N_CTX), device=q.device, dtype=torch.float32),
+    )
+
+
 class JVPAttn(Function):
     """JVP (Jacobian-Vector Product) for Attention Mechanism."""
 
@@ -2475,7 +2669,28 @@ class JVPAttn(Function):
             """Determine grid configuration."""
             return (triton.cdiv(N_CTX, META["BLOCK_M"]), Z_H, 1)  # was JVPAttn.Grid
 
-        if USE_TMA and supports_tma():
+        if ENABLE_JVP and _is_compiling():
+            if q_t is None or k_t is None or v_t is None:
+                raise RuntimeError(
+                    "Expected dual tangents q_t, k_t, v_t when compiling JVP attention."
+                )
+            with torch.no_grad():
+                o, o_t, M = _attn_fwd_dual_triton(
+                    q,
+                    k,
+                    v,
+                    q_t,
+                    k_t,
+                    v_t,
+                    mask_tensor,
+                    sm_scale,
+                    dropout_p,
+                    philox_seed,
+                    causal,
+                    warp_specialize,
+                    MASK_TYPE,
+                )
+        elif USE_TMA and supports_tma():
             # NOTE: On Hopper, we cannot perform a FP8 dot with a non-transposed second tensor.
             y_dim = Z_H * N_CTX
             tma_block_shape = [MIN_SEQUENCE_LENGTH, HEAD_DIM_K]
