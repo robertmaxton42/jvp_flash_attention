@@ -2379,7 +2379,7 @@ class JVPAttn(Function):
 
         if causal and attn_mask is not None:
             raise ValueError("Causal attention does not support an attention mask.")
-        if attn_mask is not None:
+        if attn_mask is not None and verify_attn_mask:
             assert attn_mask.shape == (
                 Z,
                 H,
