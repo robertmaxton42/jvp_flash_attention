@@ -2422,9 +2422,9 @@ class JVPAttn(Function):
 
             triton.set_allocator(alloc_fn)
 
-        def strides_zhnd(t: Tensor) -> JVPAttn.Strides:
+        def strides_zhnd(t: Tensor) -> tuple[int, int, int, int]:
             """Get strides for a tensor with shape (Z, H, N_CTX, HEAD_DIM)."""
-            return JVPAttn.Strides(t.stride(0), t.stride(1), t.stride(2), t.stride(3))
+            return (t.stride(0), t.stride(1), t.stride(2), t.stride(3))  # was JVPAttn.Strides
 
         # Determine mask type
         if attn_mask is None:
@@ -2471,9 +2471,9 @@ class JVPAttn(Function):
         # Set up grid for kernel launch
         Z_H = Z * H
 
-        def grid(META: dict[str, Any]) -> JVPAttn.Grid:
+        def grid(META: dict[str, Any]) -> tuple[int, int, int]:
             """Determine grid configuration."""
-            return JVPAttn.Grid(triton.cdiv(N_CTX, META["BLOCK_M"]), Z_H, 1)
+            return (triton.cdiv(N_CTX, META["BLOCK_M"]), Z_H, 1)  # was JVPAttn.Grid
 
         if USE_TMA and supports_tma():
             # NOTE: On Hopper, we cannot perform a FP8 dot with a non-transposed second tensor.
@@ -2630,9 +2630,9 @@ class JVPAttn(Function):
                 **extra_kern_args,
             )
 
-        return JVPAttn.FwdOut(
+        return (  # was JVPAttn.FwdOut
             o,
-            JVPAttn.FwdOutCtxContrib(
+            (  # was JVPAttn.FwdOutCtxContrib
                 o_t,
                 M,
                 grid,
@@ -2831,7 +2831,7 @@ class JVPAttn(Function):
         Returns:
             The JVP output.
         """
-        return JVPAttn.JVPOut(ctx.saved_for_forward[0], None)
+        return (ctx.saved_for_forward[0], None)  # was JVPAttn.JVPOut
 
     @staticmethod
     def backward(ctx, do, _) -> JVPAttn.BwdOut:
@@ -2979,9 +2979,7 @@ class JVPAttn(Function):
             num_warps=4,  #
         )
 
-        return JVPAttn.BwdOut(
-            dq, dk, dv, None, None, None, None, None, None, None, None, None, None
-        )
+        return (dq, dk, dv, None, None, None, None, None, None, None, None, None, None)  # was JVPAttn.BwdOut
 
 
 attention = JVPAttn.fwd
