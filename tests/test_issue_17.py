@@ -8,7 +8,7 @@ from transformers.masking_utils import create_causal_mask
 from jvp_flash_attention.jvp_attention import JVPAttn
 
 
-ATOL = 1e-3
+ATOL = 1e-5
 
 
 def jvp_attention_wrapper(
@@ -95,15 +95,7 @@ def run_stage(name, fn):
     except Exception as exc:
         print(f"{name}: FAILED")
         print(f"  {type(exc).__name__}: {exc}")
-        unsupported_markers = (
-            "Unsupported custom jvp",
-            "Graph break under GenericContextWrappingVariable",
-            "Dynamic shape operator",
-        )
-        if any(marker in str(exc) for marker in unsupported_markers):
-            print("  likely cause: torch.compile/fullgraph cannot trace this functional_call + custom jvp path")
-            return {"name": name, "primal": float("nan"), "tangent": float("nan"), "unsupported": True}
-        return {"name": name, "primal": float("inf"), "tangent": float("inf"), "unsupported": False}
+        return {"name": name, "primal": float("inf"), "tangent": float("inf")}
 
 
 if __name__ == "__main__":
@@ -177,24 +169,6 @@ if __name__ == "__main__":
         run_stage(
             "direct_jvp_attention",
             lambda: compare_input_jvp("direct_jvp_attention", direct_attn, (q, k, v), (q_t, k_t, v_t)),
-        )
-    )
-
-    explicit_causal_mask = torch.ones((1, 1, 32, 32), device=device, dtype=q.dtype).tril()
-    explicit_causal_mask = (1.0 - explicit_causal_mask) * torch.finfo(q.dtype).min
-
-    def direct_attn_explicit_mask(q_, k_, v_):
-        return JVPAttn.fwd_dual(q_, k_, v_, attn_mask=explicit_causal_mask, causal=False)
-
-    results.append(
-        run_stage(
-            "explicit_causal_mask_raw_path",
-            lambda: compare_input_jvp(
-                "explicit_causal_mask_raw_path",
-                direct_attn_explicit_mask,
-                (q, k, v),
-                (q_t, k_t, v_t),
-            ),
         )
     )
 
@@ -294,13 +268,9 @@ if __name__ == "__main__":
         )
     )
 
-    print(f"\nFirst stage exceeding atol={ATOL}:")
+    print("\nFirst stage exceeding atol=1e-5:")
     first_bad = next(
-        (
-            r
-            for r in results
-            if not r.get("unsupported", False) and (r["primal"] > ATOL or r["tangent"] > ATOL)
-        ),
+        (r for r in results if r["primal"] > ATOL or r["tangent"] > ATOL),
         None,
     )
     if first_bad is None:
