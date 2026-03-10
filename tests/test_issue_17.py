@@ -30,6 +30,12 @@ def jvp_attention_wrapper(
     )
 
 
+class StableGPT2LMHeadModel(GPT2LMHeadModel):
+    def __init__(self, config):
+        config._attn_implementation = "eager"
+        super().__init__(config)
+
+
 class GPTWrapperModel(nn.Module):
     def __init__(self, model):
         super().__init__()
@@ -62,7 +68,7 @@ if __name__ == "__main__":
         n_positions=32,
         use_cache=False,
     )
-    model = GPTWrapperModel(GPT2LMHeadModel(config).to(device))
+    model = GPTWrapperModel(StableGPT2LMHeadModel(config).to(device))
     model.eval()
 
     batch_size, seq_len = 1, 32
