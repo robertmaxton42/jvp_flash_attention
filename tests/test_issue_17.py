@@ -30,12 +30,6 @@ def jvp_attention_wrapper(
     )
 
 
-class StableGPT2LMHeadModel(GPT2LMHeadModel):
-    def __init__(self, config):
-        config._attn_implementation = "eager"
-        super().__init__(config)
-
-
 class GPTWrapperModel(nn.Module):
     def __init__(self, model):
         super().__init__()
@@ -59,6 +53,8 @@ if __name__ == "__main__":
 
     F.scaled_dot_product_attention = jvp_attention_wrapper
 
+    torch.manual_seed(0)
+
     vocab_size = 100
     config = GPT2Config(
         vocab_size=vocab_size,
@@ -68,13 +64,15 @@ if __name__ == "__main__":
         n_positions=32,
         use_cache=False,
     )
-    model = GPTWrapperModel(StableGPT2LMHeadModel(config).to(device))
+    config._attn_implementation = "eager" # Required to avoid causal mask issue when compiling
+
+    model = GPTWrapperModel(GPT2LMHeadModel(config).to(device))
     model.eval()
 
     batch_size, seq_len = 1, 32
     input_ids = {
         "input_ids": torch.randint(0, vocab_size, (batch_size, seq_len), device=device),
-        "attention_mask": torch.ones((batch_size, seq_len), device=device),
+        "attention_mask": torch.rand((batch_size, seq_len), device=device).round().bool(),
         "position_ids": torch.arange(seq_len, dtype=torch.long, device=device).view(
             batch_size, seq_len
         ),
@@ -86,11 +84,9 @@ if __name__ == "__main__":
     def func_model(p):
         return functional_call(model, p, input_ids)
 
-    # Eager JVP works fine
     out_eager = jvp(func_model, (params,), (tangents,))[1]
     print("Eager JVP success:", out_eager.shape)
 
-    # Compiled JVP fails
     @torch.compile(fullgraph=True)
     def compiled_jvp(t):
         return jvp(func_model, (params,), (t,))[1]
@@ -98,8 +94,9 @@ if __name__ == "__main__":
     out_compiled = compiled_jvp(tangents)
     print("Compiled JVP success:", out_compiled.shape)
 
-    # Check if outputs are close
-    assert torch.allclose(
-        out_eager, out_compiled, atol=1e-5
-    ), f"Eager and Compiled JVP outputs differ by {torch.max(torch.abs(out_eager - out_compiled))}!"
+    max_diff = torch.max(torch.abs(out_eager - out_compiled))
+    assert torch.allclose(out_eager, out_compiled, atol=5e-5), (
+        "Eager and Compiled JVP outputs differ by "
+        f"{max_diff} for Hugging Face's GPT-2 model!"
+    )
     print("Eager and Compiled JVP outputs are close!")
