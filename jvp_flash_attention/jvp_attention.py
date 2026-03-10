@@ -102,6 +102,91 @@ def _is_compiling() -> bool:
             return False
 
 
+def _expand_mask_heads(attn_mask: Tensor | None, num_heads: int) -> Tensor | None:
+    """Broadcast a singleton head dimension to all attention heads."""
+    if attn_mask is None or attn_mask.ndim != 4 or attn_mask.shape[1] != 1:
+        return attn_mask
+    return attn_mask.expand(attn_mask.shape[0], num_heads, attn_mask.shape[2], attn_mask.shape[3])
+
+
+def _canonicalize_binary_additive_mask(attn_mask: Tensor, dtype: torch.dtype) -> Tensor:
+    """Map binary additive masks to the library's masking convention."""
+    if attn_mask.dtype == torch.bool:
+        return attn_mask
+
+    mask = attn_mask.to(dtype)
+    if _is_compiling():
+        return mask
+
+    masked = mask != 0
+    if not masked.any():
+        return mask
+
+    masked_values = mask[masked]
+    unmasked_values = mask[~masked]
+    if unmasked_values.numel() > 0 and not torch.all(unmasked_values == 0):
+        return mask
+    if masked_values.numel() == 0 or not torch.all(masked_values < 0):
+        return mask
+
+    masked_value = masked_values.reshape(-1)[0]
+    if not torch.all(masked_values == masked_value):
+        return mask
+
+    return torch.where(masked, torch.full_like(mask, MASK_CONST), torch.zeros_like(mask))
+
+
+def _is_standard_causal_mask(attn_mask: Tensor | None) -> bool:
+    """Detect masks equivalent to a lower-triangular causal mask."""
+    if attn_mask is None or attn_mask.ndim != 4:
+        return False
+
+    q_len, kv_len = attn_mask.shape[-2:]
+    causal_keep = torch.ones((q_len, kv_len), device=attn_mask.device, dtype=torch.bool).tril()
+    causal_keep = causal_keep.view(1, 1, q_len, kv_len)
+
+    if attn_mask.dtype == torch.bool:
+        return torch.equal(attn_mask.to(torch.bool), causal_keep)
+
+    attend = attn_mask == 0
+    masked = ~attend
+    if not torch.equal(attend, causal_keep):
+        return False
+
+    masked_values = attn_mask[masked]
+    return masked_values.numel() > 0 and torch.all(masked_values < 0)
+
+
+def _normalize_attn_mask(
+    q: Tensor,
+    attn_mask: Tensor | None,
+    causal: bool,
+) -> tuple[Tensor | None, bool]:
+    """Normalize Hugging Face SDPA masks to JVPAttn's internal conventions."""
+    if attn_mask is None:
+        return None, causal
+
+    attn_mask = _expand_mask_heads(attn_mask, q.shape[1])
+    if _is_compiling() and not causal and attn_mask.ndim == 4:
+        # During torch.compile, Hugging Face SDPA materializes a square 4D causal
+        # mask because tracing cannot preserve the `is_causal` control flow.
+        # Canonicalize that back to the implicit causal path without inspecting
+        # mask values, which would otherwise introduce data-dependent graph breaks.
+        if (
+            attn_mask.shape[0] == q.shape[0]
+            and attn_mask.shape[1] == q.shape[1]
+            and attn_mask.shape[2] == q.shape[2]
+            and attn_mask.shape[3] == q.shape[2]
+        ):
+            return None, True
+    attn_mask = _canonicalize_binary_additive_mask(attn_mask, q.dtype)
+
+    if not causal and _is_standard_causal_mask(attn_mask):
+        return None, True
+
+    return attn_mask, causal
+
+
 @triton.jit
 def create_dropout_mask(philox_seed, philox_offset, dropout_p, m, n, stride):
     """Generate dropout mask using Philox RNG.
@@ -2949,6 +3034,7 @@ class JVPAttn(Function):
         """
         if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
             q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        attn_mask, causal = _normalize_attn_mask(q, attn_mask, causal)
 
         out: JVPAttn.FwdOut = JVPAttn.apply(
             q,
@@ -3006,6 +3092,7 @@ class JVPAttn(Function):
         """
         if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
             q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        attn_mask, causal = _normalize_attn_mask(q, attn_mask, causal)
 
         q_p, q_t = fwAD.unpack_dual(q)
         k_p, k_t = fwAD.unpack_dual(k)
