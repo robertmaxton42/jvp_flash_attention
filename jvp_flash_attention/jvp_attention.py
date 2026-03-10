@@ -3011,6 +3011,35 @@ class JVPAttn(Function):
         k_p, k_t = fwAD.unpack_dual(k)
         v_p, v_t = fwAD.unpack_dual(v)
 
+        if _is_compiling() and q_t is not None and k_t is not None and v_t is not None:
+            o, (
+                o_t,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+            ) = JVPAttn.forward(
+                q_p,
+                k_p,
+                v_p,
+                q_t,
+                k_t,
+                v_t,
+                attn_mask,
+                dropout_p,
+                causal,
+                sm_scale,
+                warp_specialize,
+                USE_TMA,
+                verify_attn_mask,
+            )
+            return fwAD.make_dual(o, o_t)
+
         # NOTE: We pass some dualtensor args to ensure jvp() will be called,
         # but we also pass tangents separately, as forward() demotes dual
         # tensor args to primals for some reason.
