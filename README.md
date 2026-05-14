@@ -532,6 +532,10 @@ If you use the code associated with this package or otherwise find this work use
 }
 ```
 
+## Demonstrated use cases
+
+- [EchoLVFM (MICCAI 2026)](https://github.com/EngEmmanuel/EchoLVFM)
+
 ## Acknowledgements
 
 `jvp_flash_attention` builds upon the contributions and insights from the following sources:
