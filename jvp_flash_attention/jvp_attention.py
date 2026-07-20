@@ -26,6 +26,7 @@ import os
 from typing import Any, Literal, NamedTuple
 
 import torch
+import torch.nn.functional as F
 import torch.autograd.forward_ad as fwAD
 import triton
 import triton.language as tl
@@ -244,7 +245,8 @@ def _attn_fwd_inner(
         qk = tl.dot(q, k)
         if ENABLE_JVP:
             t_k = tl.load(T_K_block_ptr)
-            t_qk = tl.dot(t_q, k) + tl.dot(q, t_k)
+            # Ensure tangents match primal dtype for tl.dot
+            t_qk = tl.dot(t_q.to(q.dtype), k) + tl.dot(q, t_k.to(k.dtype))
 
         # Load and apply attention mask if provided (before scaling for STAGE != 2)
         if MASK_TYPE > 0:
@@ -265,6 +267,8 @@ def _attn_fwd_inner(
         elif STAGE == 2:
             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
             qk = qk * qk_scale + tl.where(mask, 0.0, MASK_CONST)
+            if ENABLE_JVP:
+                t_qk = tl.where(mask, t_qk, 0.0)
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             qk -= m_ij[:, None]
 
@@ -326,11 +330,13 @@ def _attn_fwd_inner(
             mu_ij = tl.sum(p_tqk, 1)
             mu_i = mu_i * alpha + mu_ij
             t_v = tl.load(T_V_block_ptr)
-            p_tv_acc = p_tv_acc * alpha[:, None] + tl.dot(p, t_v.to(dtype)).to(t_v.dtype)
+            # Fix dtype mismatch: use 3-arg tl.dot for mixed-precision accumulation
+            p_tv_acc = tl.dot(p.to(t_v.dtype), t_v, p_tv_acc * alpha[:, None])
             T_V_block_ptr = tl.advance(T_V_block_ptr, (BLOCK_N, 0))
             T_K_block_ptr = tl.advance(T_K_block_ptr, (0, BLOCK_N))
 
-        acc = tl.dot(p, v.to(dtype), acc).to(acc.dtype)
+        # Fix dtype mismatch: use 3-arg tl.dot for mixed-precision accumulation
+        acc = tl.dot(p.to(v.dtype), v, acc)
 
         # -- Update m_i --
         m_i = m_ij
@@ -457,7 +463,8 @@ def _attn_fwd_inner_tma(
         qk = tl.dot(q, k)
         if ENABLE_JVP:
             t_k = desc_k_t.load([offsetk_y, 0]).T
-            t_qk = tl.dot(t_q, k) + tl.dot(q, t_k)
+            # Ensure tangents match primal dtype for tl.dot
+            t_qk = tl.dot(t_q.to(q.dtype), k) + tl.dot(q, t_k.to(k.dtype))
 
         # Load and apply attention mask if provided (before scaling for STAGE != 2)
         if MASK_TYPE > 0:
@@ -478,6 +485,8 @@ def _attn_fwd_inner_tma(
         elif STAGE == 2:
             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
             qk = qk * qk_scale + tl.where(mask, 0.0, MASK_CONST)
+            if ENABLE_JVP:
+                t_qk = tl.where(mask, t_qk, 0.0)
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             qk -= m_ij[:, None]
 
@@ -541,10 +550,12 @@ def _attn_fwd_inner_tma(
             mu_ij = tl.sum(p_tqk, 1)
             mu_i = mu_i * alpha + mu_ij
             t_v = desc_v_t.load([offsetv_y, 0])
-            p_tv_acc = p_tv_acc * alpha[:, None] + tl.dot(p, t_v.to(dtype)).to(t_v.dtype)
+            # Fix dtype mismatch: use 3-arg tl.dot for mixed-precision accumulation
+            p_tv_acc = tl.dot(p.to(t_v.dtype), t_v, p_tv_acc * alpha[:, None])
 
         # NOTE: This non transposed v for FP8 is only supported on Blackwell
-        acc = tl.dot(p, v.to(dtype), acc).to(acc.dtype)
+        # Fix dtype mismatch: use 3-arg tl.dot for mixed-precision accumulation
+        acc = tl.dot(p.to(v.dtype), v, acc)
 
         # Update m_i and l_i
         # Place this at the end of the loop to reduce register pressure
@@ -1549,7 +1560,8 @@ def _attn_bwd_dkdv(
         ppT = pT
         ppT = ppT.to(dtype)
         do = tl.load(do_ptrs)
-        dv += tl.dot(ppT, do.to(dtype)).to(do.dtype)
+        # Fix dtype mismatch: use 3-arg tl.dot for mixed-precision accumulation
+        dv = tl.dot(ppT.to(do.dtype), do, dv)
         # NOTE: D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m)
 
@@ -1561,7 +1573,8 @@ def _attn_bwd_dkdv(
 
         dsT = pT * (dpT - Di[None, :])
         dsT = dsT.to(dtype)
-        dk += tl.dot(dsT, tl.trans(qT).to(dtype)).to(qT.dtype)
+        # Fix dtype mismatch: use 3-arg tl.dot for mixed-precision accumulation
+        dk = tl.dot(dsT.to(qT.dtype), tl.trans(qT), dk)
 
         # Increment pointers
         curr_m += step_m
@@ -1705,7 +1718,8 @@ def _attn_bwd_dq(
         # Compute dQ
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         ds = ds.to(dtype)
-        dq += tl.dot(ds, tl.trans(kT).to(dtype)).to(kT.dtype)
+        # Fix dtype mismatch: use 3-arg tl.dot for mixed-precision accumulation
+        dq = tl.dot(ds.to(kT.dtype), tl.trans(kT), dq)
 
         # Increment pointers
         curr_n += step_n
@@ -2665,6 +2679,20 @@ class JVPAttn(Function):
         # Set up grid for kernel launch
         Z_H = Z * H
 
+        # Select block size based on sequence length for better numerical stability
+        # Larger blocks = fewer accumulation steps = better precision for bf16
+        # Also improves performance on H100 with larger shared memory (228KB)
+        # Note: BLOCK_N must be <= HEAD_DIM (kernel constraint)
+        if N_CTX >= 128:
+            BLOCK_M = 128
+            BLOCK_N = min(128, HEAD_DIM_K)
+        elif N_CTX >= 64:
+            BLOCK_M = 64
+            BLOCK_N = min(64, HEAD_DIM_K)
+        else:
+            BLOCK_M = MIN_SEQUENCE_LENGTH
+            BLOCK_N = min(MIN_SEQUENCE_LENGTH, HEAD_DIM_K)
+
         def grid(META: dict[str, Any]) -> tuple[int, int, int]:
             """Determine grid configuration."""
             return (triton.cdiv(N_CTX, META["BLOCK_M"]), Z_H, 1)  # was JVPAttn.Grid
@@ -2693,13 +2721,15 @@ class JVPAttn(Function):
         elif USE_TMA and supports_tma():
             # NOTE: On Hopper, we cannot perform a FP8 dot with a non-transposed second tensor.
             y_dim = Z_H * N_CTX
-            tma_block_shape = [MIN_SEQUENCE_LENGTH, HEAD_DIM_K]
+            # Q and O use BLOCK_M, K and V use BLOCK_N
+            tma_block_shape_qo = [BLOCK_M, HEAD_DIM_K]
+            tma_block_shape_kv = [BLOCK_N, HEAD_DIM_K]
 
             desc_q = TensorDescriptor(
                 q,
                 shape=[y_dim, HEAD_DIM_K],
                 strides=[HEAD_DIM_K, 1],
-                block_shape=tma_block_shape,
+                block_shape=tma_block_shape_qo,
             )
             desc_q_t = (
                 desc_q
@@ -2708,7 +2738,7 @@ class JVPAttn(Function):
                     q_t,
                     shape=[y_dim, HEAD_DIM_K],
                     strides=[HEAD_DIM_K, 1],
-                    block_shape=tma_block_shape,
+                    block_shape=tma_block_shape_qo,
                 )
             )
 
@@ -2719,7 +2749,7 @@ class JVPAttn(Function):
                 v_shape = [y_dim, HEAD_DIM_K]
                 v_strides = [HEAD_DIM_K, 1]
             desc_v = TensorDescriptor(
-                v, shape=v_shape, strides=v_strides, block_shape=tma_block_shape
+                v, shape=v_shape, strides=v_strides, block_shape=tma_block_shape_kv
             )
             # NOTE: Probably we could share the shape and strides from above, but whatever
             if q_t is not None and q_t.dtype == torch.float8_e5m2:
@@ -2732,7 +2762,7 @@ class JVPAttn(Function):
                 desc_v
                 if v_t is None
                 else TensorDescriptor(
-                    v_t, shape=t_v_shape, strides=t_v_strides, block_shape=tma_block_shape
+                    v_t, shape=t_v_shape, strides=t_v_strides, block_shape=tma_block_shape_kv
                 )
             )
 
@@ -2740,7 +2770,7 @@ class JVPAttn(Function):
                 k,
                 shape=[y_dim, HEAD_DIM_K],
                 strides=[HEAD_DIM_K, 1],
-                block_shape=tma_block_shape,
+                block_shape=tma_block_shape_kv,
             )
             desc_k_t = (
                 desc_k
@@ -2749,7 +2779,7 @@ class JVPAttn(Function):
                     k_t,
                     shape=[y_dim, HEAD_DIM_K],
                     strides=[HEAD_DIM_K, 1],
-                    block_shape=tma_block_shape,
+                    block_shape=tma_block_shape_kv,
                 )
             )
 
@@ -2757,7 +2787,7 @@ class JVPAttn(Function):
                 o,
                 shape=[y_dim, HEAD_DIM_K],
                 strides=[HEAD_DIM_K, 1],
-                block_shape=tma_block_shape,
+                block_shape=tma_block_shape_qo,
             )
             desc_o_t = (
                 desc_o
@@ -2766,7 +2796,7 @@ class JVPAttn(Function):
                     o_t,
                     shape=[y_dim, HEAD_DIM_K],
                     strides=[HEAD_DIM_K, 1],
-                    block_shape=tma_block_shape,
+                    block_shape=tma_block_shape_qo,
                 )
             )
 
@@ -2795,9 +2825,8 @@ class JVPAttn(Function):
                 ENABLE_JVP=ENABLE_JVP,  #
                 ENABLE_DROPOUT=ENABLE_DROPOUT,
                 MASK_TYPE=MASK_TYPE,
-                # NOTE: The following are safe (unit-tested) default values
-                BLOCK_M=MIN_SEQUENCE_LENGTH,  #
-                BLOCK_N=MIN_SEQUENCE_LENGTH,  #
+                BLOCK_M=BLOCK_M,  #
+                BLOCK_N=BLOCK_N,  #
                 num_stages=NUM_STAGES_OPTIONS[0],  #
                 num_warps=4,  #
                 **extra_kern_args,
@@ -2837,9 +2866,8 @@ class JVPAttn(Function):
                 ENABLE_JVP=ENABLE_JVP,  #
                 ENABLE_DROPOUT=ENABLE_DROPOUT,
                 MASK_TYPE=MASK_TYPE,
-                # NOTE: The following are safe (unit-tested) default values
-                BLOCK_M=MIN_SEQUENCE_LENGTH,  #
-                BLOCK_N=MIN_SEQUENCE_LENGTH,  #
+                BLOCK_M=BLOCK_M,  #
+                BLOCK_N=BLOCK_N,  #
                 num_stages=NUM_STAGES_OPTIONS[0],  #
                 num_warps=4,  #
                 **extra_kern_args,
@@ -2950,6 +2978,26 @@ class JVPAttn(Function):
         if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
             q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
 
+        # Pad to multiple of 32 for Triton kernel compatibility
+        N_CTX = q.shape[2]
+        pad_len = (32 - (N_CTX % 32)) % 32
+        if pad_len > 0:
+            q = F.pad(q, (0, 0, 0, pad_len))
+            k = F.pad(k, (0, 0, 0, pad_len))
+            v = F.pad(v, (0, 0, 0, pad_len))
+            if not causal:
+                if attn_mask is None:
+                    # Create boolean mask to ignore padding
+                    Z, H = q.shape[:2]
+                    N_P = N_CTX + pad_len
+                    attn_mask = torch.ones((Z, H, N_P, N_P), dtype=torch.bool, device=q.device)
+                    attn_mask[:, :, :, N_CTX:] = False
+                    attn_mask[:, :, N_CTX:, :] = False
+                else:
+                    # Pad existing mask: False/MASK_CONST for padding
+                    m_val = False if attn_mask.dtype == torch.bool else MASK_CONST
+                    attn_mask = F.pad(attn_mask, (0, pad_len, 0, pad_len), value=m_val)
+
         out: JVPAttn.FwdOut = JVPAttn.apply(
             q,
             k,
@@ -2967,6 +3015,8 @@ class JVPAttn(Function):
         )
 
         a, _ = out
+        if pad_len > 0:
+            a = a[:, :, :N_CTX, :]
         return a
 
     @staticmethod
@@ -3006,6 +3056,26 @@ class JVPAttn(Function):
         """
         if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
             q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+
+        # Pad to multiple of 32 for Triton kernel compatibility
+        N_CTX = q.shape[2]
+        pad_len = (32 - (N_CTX % 32)) % 32
+        if pad_len > 0:
+            q = F.pad(q, (0, 0, 0, pad_len))
+            k = F.pad(k, (0, 0, 0, pad_len))
+            v = F.pad(v, (0, 0, 0, pad_len))
+            if not causal:
+                if attn_mask is None:
+                    # Create boolean mask to ignore padding
+                    Z, H = q.shape[:2]
+                    N_P = N_CTX + pad_len
+                    attn_mask = torch.ones((Z, H, N_P, N_P), dtype=torch.bool, device=q.device)
+                    attn_mask[:, :, :, N_CTX:] = False
+                    attn_mask[:, :, N_CTX:, :] = False
+                else:
+                    # Pad existing mask: False/MASK_CONST for padding
+                    m_val = False if attn_mask.dtype == torch.bool else MASK_CONST
+                    attn_mask = F.pad(attn_mask, (0, pad_len, 0, pad_len), value=m_val)
 
         q_p, q_t = fwAD.unpack_dual(q)
         k_p, k_t = fwAD.unpack_dual(k)
@@ -3060,6 +3130,8 @@ class JVPAttn(Function):
         )
 
         a, _ = out
+        if pad_len > 0:
+            a = a[:, :, :N_CTX, :]
         return a
 
     @staticmethod
