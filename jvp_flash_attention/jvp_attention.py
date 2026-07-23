@@ -52,7 +52,6 @@ MASK_CONST = (
 )  # Use a large negative value for masking (compatible with float16, bfloat16, and float32)
 MIN_SEQUENCE_LENGTH = 32  # NOTE: All sequence lengths must be multiples of 2 >= 32
 
-
 def is_hip():
     """Check if the current device is HIP."""
     try:
@@ -102,6 +101,13 @@ def _is_compiling() -> bool:
             return torch._dynamo.is_compiling()
         except Exception:
             return False
+
+def _max_smem() -> int:
+    """Get the maximum shared memory size for the current device."""
+    try:
+        return torch.cuda.get_device_properties(torch.cuda.current_device()).shared_memory_per_block_optin
+    except Exception:
+        return 0
 
 
 @triton.jit
@@ -2289,7 +2295,7 @@ def _strides_zhnd(t: Tensor) -> Strides:
     return Strides(*(t.stride(i) for i in range(4)))
 
 
-def _select_fwd_block_sizes(N_CTX: int, HEAD_DIM_K: int) -> tuple[int, int]:
+def _select_fwd_block_sizes(N_CTX: int, HEAD_DIM_K: int, dtype:torch.dtype) -> tuple[int, int]:
     """Select forward-kernel block sizes based on sequence length.
 
     Larger blocks mean fewer accumulation steps (better bf16/fp16 precision) and
@@ -2298,12 +2304,9 @@ def _select_fwd_block_sizes(N_CTX: int, HEAD_DIM_K: int) -> tuple[int, int]:
     this selection, under both eager execution and torch.compile, so precision
     and performance don't depend on how the kernel happens to be invoked.
     """
-    if N_CTX >= 128:
-        return 128, min(128, HEAD_DIM_K)
-    elif N_CTX >= 64:
-        return 64, min(64, HEAD_DIM_K)
-    else:
-        return MIN_SEQUENCE_LENGTH, min(MIN_SEQUENCE_LENGTH, HEAD_DIM_K)
+    nctx = min(N_CTX, _max_smem() // dtype.itemsize)
+    M = 1 << max(5, nctx.bit_length() - 1) # The largest power of two <= N_CTX and the shared memory limit, but >= 32 (due to kernel constraints).
+    return M, min(M, HEAD_DIM_K)
 
 
 class _Padded(NamedTuple):
@@ -2433,7 +2436,6 @@ def _attn_bwd_triton(
             "JVPAttn expected q, k, v, o to be contiguous; got "
             f"q.is_contiguous()={q.is_contiguous()}, k.is_contiguous()={k.is_contiguous()}, "
             f"v.is_contiguous()={v.is_contiguous()}, o.is_contiguous()={o.is_contiguous()}, "
-            f"do.is_contiguous()={do.is_contiguous()}"
         )
 
     # NOTE: Autograd may deliver a non-contiguous output gradient; if so, normalize it.
