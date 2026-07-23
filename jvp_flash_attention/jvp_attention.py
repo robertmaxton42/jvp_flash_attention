@@ -22,9 +22,11 @@ Plus modifications to support Jacobian-vector products (JVPs) and Hessian-vector
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from itertools import pairwise
 import os
 from typing import Any, Literal, NamedTuple, TypedDict, Unpack
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -36,7 +38,6 @@ from torch.autograd import Function
 from torch.autograd.function import FunctionCtx
 
 # NOTE: Uncomment to turn warnings into errors for debugging
-# import warnings
 # warnings.filterwarnings("error", category=UserWarning)
 # warnings.filterwarnings("error", category=RuntimeWarning)
 
@@ -46,6 +47,13 @@ try:
     HAS_TENSOR_DESC = True
 except ModuleNotFoundError:
     HAS_TENSOR_DESC = False
+
+try:
+    from triton.runtime.errors import OutOfResources
+except ImportError:  # pragma: no cover - depends on the Triton version
+
+    class OutOfResources(Exception):  # type: ignore[no-redef]
+        """Placeholder so `except OutOfResources` stays valid; never raised."""
 
 MASK_CONST = (
     -1.0e2
@@ -2294,19 +2302,78 @@ def _strides_zhnd(t: Tensor) -> Strides:
     """Get strides for a tensor with shape (Z, H, N_CTX, HEAD_DIM)."""
     return Strides(*(t.stride(i) for i in range(4)))
 
+#: Pipelining depth passed as `num_stages` at every forward launch. The shared
+#: memory estimate has to agree with it, so it is named once, here.
+FWD_NUM_STAGES = NUM_STAGES_OPTIONS[0]
 
-def _select_fwd_block_sizes(N_CTX: int, HEAD_DIM_K: int, dtype:torch.dtype) -> tuple[int, int]:
+# def _fwd_smem_bytes(
+#     block_m: int,
+#     block_n: int,
+#     head_dim: int,
+#     itemsize: int,
+#     num_stages: int,
+#     enable_jvp: bool,
+# ) -> int:
+#     """Estimate per-program shared memory for the forward kernel, in bytes.
+
+#     Only the *loaded* tiles live in smem, so this scales with the input dtype's
+#     itemsize; the fp32 accumulators (acc/g_acc/p_tv_acc) are register-resident,
+#     which is what `maxnreg` budgets for instead. JVP roughly doubles both terms
+#     by adding the T_K/T_V pipeline and the resident T_Q tile.
+
+#     The two terms are the multi-buffered K/V tiles (`2 * num_stages * block_n`,
+#     which dominates) and the resident Q tile (`block_m`).
+
+#     NOTE: An upper bound, not ground truth -- Triton decides for itself what to
+#     stage and how deeply to multi-buffer. The OutOfResources retry in
+#     `_attn_fwd_triton` is the actual backstop.
+#     """
+#     return itemsize * head_dim * (int(enable_jvp) + 1) * (2 * num_stages * block_n + block_m)
+
+def _select_fwd_block_sizes(N_CTX: int, HEAD_DIM_K: int, enable_jvp: bool, 
+                            dtype: torch.dtype, fallback: int = 0) -> Generator[tuple[int, int], None, None]:
     """Select forward-kernel block sizes based on sequence length.
 
-    Larger blocks mean fewer accumulation steps (better bf16/fp16 precision) and
-    better performance on GPUs with more shared memory, but BLOCK_N must stay
-    <= HEAD_DIM (a kernel constraint). Both the plain and TMA launch paths use
-    this selection, under both eager execution and torch.compile, so precision
-    and performance don't depend on how the kernel happens to be invoked.
+        Args:
+            N_CTX: Sequence length.
+            HEAD_DIM_K: Head dimension (K).
+            enable_jvp: Whether JVP is enabled.
+            dtype: Data type of the input tensors.
+            fallback: Divide block size by 2 ** fallback. If a launch OOMs, relaunch with fallback+=1.
     """
-    nctx = min(N_CTX, _max_smem() // dtype.itemsize)
-    M = 1 << max(5, nctx.bit_length() - 1) # The largest power of two <= N_CTX and the shared memory limit, but >= 32 (due to kernel constraints).
-    return M, min(M, HEAD_DIM_K)
+    # Larger BLOCK_M mean fewer accumulation steps (better bf16/fp16 precision) and
+    # better performance on GPUs with more shared memory, but kernel constraints require
+    # BLOCK_N <= HEAD_DIM_K.
+    # 
+    # ∴ First select BLOCK_M based on sequence length and pay for it out of BLOCK_N
+    # ∴ If we can't do that without driving BLOCK_N below MIN_SEQUENCE_LENGTH, only
+    #   then resort to reducing BLOCK_M.
+    # 
+    # If we OOM anyway (because Triton allocated some extra somewhere we didn't account for),
+    # rerun with fallback+=1, which essentially pushes us down the ladder one step --
+    # first reducing BLOCK_N, then BLOCK_M if necessary.
+    # 
+    # Both the plain and TMA launch paths use
+    # this selection, under both eager execution and torch.compile, so precision
+    # and performance don't depend on how the kernel happens to be invoked.
+    NUM_STAGES = 2
+    _lg_floor = lambda x: 1 << (x.bit_length() - 1) # Largest power of two <= x, assuming x > 0.
+    smem_bound = _max_smem() // (dtype.itemsize * (2 if enable_jvp else 1) * HEAD_DIM_K * 2 ** fallback)
+    if _max_smem() == 0:
+        warnings.warn(f"Running on CPU; block size selection defaulting to ({MIN_SEQUENCE_LENGTH}, {MIN_SEQUENCE_LENGTH})")
+        yield MIN_SEQUENCE_LENGTH, MIN_SEQUENCE_LENGTH
+    _clamp = lambda x, low, high: max(low, min(x, high))
+
+    max_M = _lg_floor(smem_bound - 2 * NUM_STAGES * MIN_SEQUENCE_LENGTH)
+    if max_M < MIN_SEQUENCE_LENGTH or HEAD_DIM_K < MIN_SEQUENCE_LENGTH:
+        # not enough smem to run the kernel; just return the minimum block sizes and let Triton report its OOM error
+        yield MIN_SEQUENCE_LENGTH, MIN_SEQUENCE_LENGTH
+    
+    # The largest power of two <= N_CTX and the shared memory limit, but >= MIN_SEQUENCE_LENGTH.
+    M = _clamp(_lg_floor(N_CTX)         , MIN_SEQUENCE_LENGTH, max_M)
+    N = _clamp(_lg_floor((smem_bound - M) // (2 * NUM_STAGES)), MIN_SEQUENCE_LENGTH, HEAD_DIM_K)
+    yield M, N
+    yield from _select_fwd_block_sizes(N_CTX, HEAD_DIM_K, enable_jvp, dtype, fallback + 1)
 
 
 class _Padded(NamedTuple):
@@ -2585,10 +2652,6 @@ class _FwdLaunchConfig(TypedDict):
     Computed once in `_attn_fwd_triton` and threaded through to whichever
     launcher is selected, so the plain and TMA paths cannot drift apart in
     block size, staging, or device-specific kernel arguments.
-
-    NOTE: These are our own field names, not the kernels' parameter names; each
-    launcher maps them onto its kernel's signature explicitly. They cannot be
-    forwarded to a Triton kernel with `**cfg`.
     """
 
     Z: int
@@ -2876,7 +2939,16 @@ def _attn_fwd_triton(
     o_t: Tensor | None = torch.empty_like(q_t) if ENABLE_JVP else None
     M = torch.empty((Z, H, N_CTX), device=q.device, dtype=torch.float32)
 
-    block_m, block_n = _select_fwd_block_sizes(N_CTX, HEAD_DIM_K)
+    def grid(META: dict[str, Any]) -> Grid:
+        """Resolve the launch grid from the kernel's bound arguments.
+
+        Reading BLOCK_M back out of META rather than closing over `block_m`
+        keeps this correct if the kernels' autotune decorators are re-enabled.
+        """
+        return Grid(triton.cdiv(N_CTX, META["BLOCK_M"]), Z * H, 1)
+
+    launch = _launch_attn_fwd_tma if use_tma and supports_tma() else _launch_attn_fwd
+
     cfg: _FwdLaunchConfig = {
         "Z": Z,
         "H": H,
@@ -2892,23 +2964,33 @@ def _attn_fwd_triton(
         "enable_dropout": dropout_p > 0.0,
         "mask_type": mask_type,
         "mask_strides": NO_STRIDES if mask_type == 0 else _strides_zhnd(mask_tensor),
-        "block_m": block_m,
-        "block_n": block_n,
+        "block_m": MIN_SEQUENCE_LENGTH,
+        "block_n": MIN_SEQUENCE_LENGTH,
         "extra_kern_args": _attn_fwd_extra_kern_args(
             HEAD_DIM_K, q.dtype, warp_specialize, ENABLE_JVP
         ),
     }
-
-    def grid(META: dict[str, Any]) -> Grid:
-        """Resolve the launch grid from the kernel's bound arguments.
-
-        Reading BLOCK_M back out of META rather than closing over `block_m`
-        keeps this correct if the kernels' autotune decorators are re-enabled.
-        """
-        return Grid(triton.cdiv(N_CTX, META["BLOCK_M"]), Z * H, 1)
-
-    launch = _launch_attn_fwd_tma if use_tma and supports_tma() else _launch_attn_fwd
-    launch(q, k, v, q_t, k_t, v_t, o, o_t, M, mask_tensor, grid=grid, **cfg)
+    # `_select_fwd_block_sizes` only estimates shared memory use, so a launch can
+    # still be refused. Triton raises OutOfResources while loading the kernel,
+    # before it runs, so no output has been written and stepping down the ladder
+    # and retrying is safe. Retry until the selection stops changing, i.e. until
+    # the smallest permissible blocks have been tried.
+    for prev, nxt in pairwise(_select_fwd_block_sizes(N_CTX, HEAD_DIM_K, ENABLE_JVP, q.dtype)):
+        cfg["block_m"], cfg["block_n"] = nxt
+        try:
+            launch(q, k, v, q_t, k_t, v_t, o, o_t, M, mask_tensor, grid=grid, **cfg)
+            break
+        except OutOfResources:
+            if nxt == prev:
+                # Already at the smallest blocks, so let Triton's own error through.
+                raise
+            warnings.warn(
+                f"Triton refused BLOCK_M={nxt[0]}, BLOCK_N={nxt[1]} for "
+                f"N_CTX={N_CTX}, HEAD_DIM={HEAD_DIM_K}, dtype={q.dtype}, "
+                f"JVP={ENABLE_JVP}; retrying with smaller blocks.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     return o, o_t, M
 
