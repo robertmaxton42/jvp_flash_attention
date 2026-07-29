@@ -2980,10 +2980,10 @@ def _attn_fwd_triton(
         try:
             launch(q, k, v, q_t, k_t, v_t, o, o_t, M, mask_tensor, grid=grid, **cfg)
             break
-        except OutOfResources:
+        except OutOfResources as e:
             if nxt == prev:
                 # Already at the smallest blocks, so let Triton's own error through.
-                raise
+                raise Exception("Minimum block sizes failed to launch.") from e
             warnings.warn(
                 f"Triton refused BLOCK_M={nxt[0]}, BLOCK_N={nxt[1]} for "
                 f"N_CTX={N_CTX}, HEAD_DIM={HEAD_DIM_K}, dtype={q.dtype}, "
